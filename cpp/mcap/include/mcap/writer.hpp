@@ -104,6 +104,8 @@ struct MCAP_PUBLIC McapWriterOptions {
   bool noStatistics = false;
   bool noSummaryOffsets = false;
 
+  bool noIoUring = false;
+
   McapWriterOptions(const std::string_view profile)
       : profile(profile) {}
 };
@@ -167,7 +169,8 @@ class MCAP_PUBLIC FileWriter final : public IWritable {
 public:
   ~FileWriter() override;
 
-  Status open(std::string_view filename);
+  Status openStd(std::string_view filename);
+  Status openUring(std::string_view filename);
 
   void handleWrite(const std::byte* data, uint64_t size) override;
   void end() override;
@@ -175,8 +178,13 @@ public:
   uint64_t size() const override;
 
 private:
+  bool isUring_ = false;
   std::FILE* file_ = nullptr;
   uint64_t size_ = 0;
+
+  void uringClose();
+  void handleWriteStd(const std::byte* data, uint64_t size);
+  void handleWriteUring(const std::byte* data, uint64_t size);
 };
 
 /**
