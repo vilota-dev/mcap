@@ -16,17 +16,10 @@
  #define MCAP_ARM64
 #endif
 
-#include <chrono>
-#include <thread>
-#include <vector>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/resource.h>    // setpriority, PRIO_PROCESS
 
-#include <liburing.h>
 #include <cstring>
 #include <vector>
 #include <chrono>
@@ -94,31 +87,9 @@ void IWritable::resetCrc() {
 }
 
 // FileWriter //////////////////////////////////////////////////////////////////
-
-
-    constexpr size_t BUFFER_SIZE = 140 * 1024 * 1024;
-    constexpr size_t IORING_BUFF_SIZE = 100 * 1024 * 1024;
-    int fd_=-1;
-    struct io_uring ring_;
-    bool ringInited_=false;
-    void* buf_ = nullptr;
-    void *bufpong_=nullptr;
-    uint64_t writeOffset_=0; // current offset in file
-    static constexpr int QUEUE_DEPTH = 128;
-    static constexpr size_t ALIGNMENT = 512;
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool ready = false;
-    std::atomic<bool> running{true};
+    
     uint64_t mcap_buffsize=0;
-    int final_footer_count = 0;
-    bool final_footer = false;
-    bool ping_buffer_used=true;
-    std::thread workerThread_;
-    uint64_t aligned_blocks=0;
-
-    void worker_thread();
-
+    bool io_uring_=false; 
     Status FileWriter::openUring(std::string_view filename) {
      end();
      fd_ = ::open(filename.data(), O_CREAT |O_RDWR | O_TRUNC | O_DIRECT, 0644);
@@ -166,18 +137,17 @@ void IWritable::resetCrc() {
       size_ = 0;
       writeOffset_ = 0;
       isUring_ = true;
-
       running=true;
       ready=false;
       mcap_buffsize=0;
       ping_buffer_used=true;
-      std::thread t(worker_thread);
+      std::thread t(&FileWriter::worker_thread,this);
       workerThread_ = std::move(t); // Store in a class member
       return StatusCode::Success;
     }
 
 
-    void worker_thread() {
+    void FileWriter::worker_thread() {
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
       CPU_SET(0, &cpuset);
@@ -186,13 +156,13 @@ void IWritable::resetCrc() {
       if (setpriority(PRIO_PROCESS, tid, -18) != 0) {
         perror("setpriority failed");
       } else {
-        std::cout << " rest Nice value set to " << std::endl;
+        std::cout << " Nice value set to " << std::endl;
       }
 
       std::unique_lock<std::mutex> lock(mtx); // ✅ This must be defined
       while(running)
       {
-       cv.wait(lock, [] { return ready; });  // Wait until ready is
+       cv.wait(lock, [this] { return ready; });  // Wait until ready is
          io_uring_cqe* cqe;
          if (io_uring_wait_cqe(&ring_, &cqe) < 0) {
              std::cerr << "io_uring_wait_cqe failed\n";
@@ -208,15 +178,15 @@ void IWritable::resetCrc() {
      }
     std::cout << "Detached thread received signal. Proceeding..." << std::endl;
     }
-    inline void* getActiveBuffer()  {
+    inline void* FileWriter::getActiveBuffer()  {
         return ping_buffer_used ? buf_ : bufpong_;
     }
 
-    inline void switchBuffer() {
+    inline void FileWriter::switchBuffer() {
         ping_buffer_used = !ping_buffer_used;
     }
 
-    inline void* getInactiveBuffer()  {
+    inline void* FileWriter::getInactiveBuffer()  {
     return ping_buffer_used ? bufpong_ : buf_;
     }
 
@@ -310,7 +280,6 @@ void IWritable::resetCrc() {
           // Align mcap_buffsize up to next multiple of ALIGNMENT
           size_t aligned_size = (mcap_buffsize + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
           size_t appended_bytes = aligned_size - mcap_buffsize;
-
           // Submit final footer write
           struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
           if (!sqe) {
@@ -318,16 +287,8 @@ void IWritable::resetCrc() {
             return;
           }
 	  void* activeBuf = getActiveBuffer();
-          if(ping_buffer_used)
-          {
-            if (!submit_fixed_write(activeBuf, aligned_size, writeOffset_, 0))
-            return;
-          }
-          else
-          {
-            if (!submit_fixed_write(activeBuf,aligned_size, writeOffset_, 1))
-            return;
-          }
+              io_uring_prep_write(sqe, 0, activeBuf,aligned_size, writeOffset_);
+              sqe->flags |= IOSQE_FIXED_FILE;
 
           int ret = io_uring_submit(&ring_);
           if (ret < 0) {
@@ -368,15 +329,12 @@ void IWritable::resetCrc() {
             std::cerr << "Cannot remove more bytes than file size\n";
             return;
           }
-
           if (ftruncate(fd_, new_size) < 0) {
             perror("ftruncate");
             return;
           } else {
             std::cout << "File truncated to " << new_size << " bytes\n";
           }
-
-
           std::cout << " after current_size " << current_size << " bytes\n";
           final_footer = false;
     }
@@ -726,6 +684,7 @@ Status McapWriter::open(const std::string_view filename, const McapWriterOptions
   // If the writer was opened, close it first
   close();
   fileOutput_ = std::make_unique<FileWriter>();
+  io_uring_=!(options.noIoUring);
   const auto status = options.noIoUring ? fileOutput_->openStd(filename) : fileOutput_->openUring(filename);
   if (!status.ok()) {
     fileOutput_.reset();
@@ -770,20 +729,17 @@ void McapWriter::close() {
 
   ByteOffset summaryStart = 0;
   ByteOffset summaryOffsetStart = 0;
-
   if (!options_.noSummary) {
     // Get the offset of the End Of File section
-    summaryStart = fileOutput.size();
-
-    ByteOffset schemaStart = fileOutput.size();
+    summaryStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
+    ByteOffset schemaStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noRepeatedSchemas) {
       // Write all schema records
       for (const auto& schemaId : writtenSchemas_) {
         write(fileOutput, schemas_[schemaId - 1]);
       }
     }
-
-    ByteOffset channelStart = fileOutput.size();
+    ByteOffset channelStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noRepeatedChannels) {
       // Write all channel records, but only if they appeared in this file
       auto& channelMessageCounts = statistics_.channelMessageCounts;
@@ -793,40 +749,36 @@ void McapWriter::close() {
         }
       }
     }
-
-    ByteOffset statisticsStart = fileOutput.size();
+    ByteOffset statisticsStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noStatistics) {
       // Write the statistics record
       write(fileOutput, statistics_);
     }
-
-    ByteOffset chunkIndexStart = fileOutput.size();
+    ByteOffset chunkIndexStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noChunkIndex) {
       // Write chunk index records
       for (const auto& chunkIndexRecord : chunkIndex_) {
         write(fileOutput, chunkIndexRecord);
       }
     }
-
-    ByteOffset attachmentIndexStart = fileOutput.size();
+    ByteOffset attachmentIndexStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noAttachmentIndex) {
       // Write attachment index records
       for (const auto& attachmentIndexRecord : attachmentIndex_) {
         write(fileOutput, attachmentIndexRecord);
       }
     }
-
-    ByteOffset metadataIndexStart = fileOutput.size();
+    ByteOffset metadataIndexStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noMetadataIndex) {
       // Write metadata index records
       for (const auto& metadataIndexRecord : metadataIndex_) {
         write(fileOutput, metadataIndexRecord);
       }
     }
-
+     uint64_t actual_filesize=(io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
     if (!options_.noSummaryOffsets) {
       // Write summary offset records
-      summaryOffsetStart = fileOutput.size();
+      summaryOffsetStart = (io_uring_ > 0) ? fileOutput.size() + mcap_buffsize : fileOutput.size();
       if (!options_.noRepeatedSchemas && !writtenSchemas_.empty()) {
         write(fileOutput, SummaryOffset{OpCode::Schema, schemaStart, channelStart - schemaStart});
       }
@@ -850,8 +802,9 @@ void McapWriter::close() {
         write(fileOutput, SummaryOffset{OpCode::MetadataIndex, metadataIndexStart,
                                         summaryOffsetStart - metadataIndexStart});
       }
-    } else if (summaryStart == fileOutput.size()) {
+    } else if (summaryStart == actual_filesize) {
       // No summary records were written
+	    std::cout<<"no summary records were wruttern "<<std::endl;
       summaryStart = 0;
     }
   }
