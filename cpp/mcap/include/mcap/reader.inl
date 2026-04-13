@@ -11,6 +11,24 @@
 
 namespace mcap {
 
+namespace {
+inline int SeekFile(std::FILE* file, uint64_t offset, int whence) {
+#ifdef _WIN32
+  return _fseeki64(file, static_cast<__int64>(offset), whence);
+#else
+  return std::fseek(file, static_cast<long>(offset), whence);
+#endif
+}
+
+inline int64_t TellFile(std::FILE* file) {
+#ifdef _WIN32
+  return _ftelli64(file);
+#else
+  return std::ftell(file);
+#endif
+}
+}  // namespace
+
 bool CompareChunkIndexes(const ChunkIndex& a, const ChunkIndex& b) {
   return a.chunkStartOffset < b.chunkStartOffset;
 }
@@ -51,9 +69,9 @@ FileReader::FileReader(std::FILE* file)
   assert(file_);
 
   // Determine the size of the file
-  std::fseek(file_, 0, SEEK_END);
-  size_ = std::ftell(file_);
-  std::fseek(file_, 0, SEEK_SET);
+  SeekFile(file_, 0, SEEK_END);
+  size_ = static_cast<uint64_t>(TellFile(file_));
+  SeekFile(file_, 0, SEEK_SET);
 }
 
 uint64_t FileReader::size() const {
@@ -66,7 +84,7 @@ uint64_t FileReader::read(std::byte** output, uint64_t offset, uint64_t size) {
   }
 
   if (offset != position_) {
-    std::fseek(file_, (long)(offset), SEEK_SET);
+    SeekFile(file_, offset, SEEK_SET);
     std::fflush(file_);
     position_ = offset;
   }
